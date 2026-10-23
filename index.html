@@ -63,6 +63,15 @@ select:focus-visible, button:focus-visible { outline: 2px solid var(--optic); ou
   background: var(--amber); color: #1a1206; font: 700 18px var(--f-display); letter-spacing: 0.08em;
 }
 .go:hover { filter: brightness(1.08); }
+.go:disabled { opacity: 0.45; cursor: default; }
+.online { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); display: grid; gap: 10px; }
+.onrow { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+.onrow .go { margin: 0; padding: 9px 16px; font-size: 15px; grid-column: auto; }
+input { background: #101811; color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; font: 600 14px var(--f-body); min-width: 0; }
+input:focus-visible { outline: 2px solid var(--optic); outline-offset: 2px; }
+.code { font-family: var(--f-data); color: var(--amber); font-size: 16px; letter-spacing: 0.12em; }
+.link { font-family: var(--f-data); font-size: 11px; color: var(--optic); word-break: break-all; user-select: all; }
+.mini { background: transparent; border: 1px solid var(--line); color: var(--fg); border-radius: 3px; padding: 2px 8px; font: 600 11px var(--f-body); cursor: pointer; }
 .keys { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .keys th { text-align: left; font-family: var(--f-display); color: var(--muted); font-weight: 600; padding: 5px 6px; border-bottom: 1px solid var(--line); }
 .keys td { padding: 5px 6px; border-bottom: 1px solid rgba(44,58,47,0.5); vertical-align: top; }
@@ -112,6 +121,8 @@ select:focus-visible, button:focus-visible { outline: 2px solid var(--optic); ou
           <select id="fcs"><option value="auto">Auto-lay (AI เล็งให้)</option><option value="advisor">Advisor (แสดงค่า)</option><option value="off">ปิด (เล็งเองล้วน)</option></select></label>
         <label for="diff">ความเก่งบอท
           <select id="diff"><option value="easy">Recruit</option><option value="normal" selected>Veteran</option><option value="hard">Elite</option><option value="ace">Ace</option></select></label>
+        <label for="driver">บอทขับด้วย
+          <select id="driver"><option value="mix" selected>ผสม: RL + สคริปต์</option><option value="rl">Neural net (RL)</option><option value="script">สคริปต์ (กฎ)</option></select></label>
         <label for="rounds">ชนะกี่รอบ
           <select id="rounds"><option value="1">1</option><option value="3" selected>3</option><option value="5">5</option></select></label>
         <div class="slots">
@@ -122,6 +133,20 @@ select:focus-visible, button:focus-visible { outline: 2px solid var(--optic); ou
         </div>
         <div class="pad" id="padinfo"></div>
         <button class="go" id="start">เริ่มสงคราม · DEPLOY</button>
+      </div>
+      <div class="online">
+        <div class="eyebrow">Online · เล่นข้ามเครื่อง</div>
+        <div class="onrow">
+          <input id="netName" maxlength="12" placeholder="ชื่อของคุณ" aria-label="ชื่อผู้เล่น">
+          <button class="go ghost" id="hostBtn">สร้างห้อง</button>
+        </div>
+        <div class="onrow">
+          <input id="joinCode" maxlength="5" placeholder="รหัสห้อง 5 ตัว" aria-label="รหัสห้อง" autocapitalize="characters">
+          <button class="go ghost" id="joinBtn">เข้าร่วม</button>
+        </div>
+        <div class="pad" id="netStatus">โฮสต์สร้างห้องแล้วส่งรหัสให้เพื่อน · เพื่อนแต่ละคนเล่นจากเครื่องตัวเอง (สูงสุด 8 คนรวมบอท) · โฮสต์ตั้งค่าโหมด/บอทแล้วกดเริ่ม</div>
+        <div class="pad" id="netPlayers"></div>
+        <div class="pad" id="onlineNote"></div>
       </div>
     </section>
     <section>
@@ -164,7 +189,11 @@ select:focus-visible, button:focus-visible { outline: 2px solid var(--optic); ou
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="js/fcs.js"></script>
+<script src="js/rl-policy.js"></script>
+<script src="js/rl-weights.js"></script>
+<script src="js/net-transport.js"></script>
 <script src="js/game.js"></script>
 </body>
 </html>

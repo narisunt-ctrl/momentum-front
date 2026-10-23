@@ -76,7 +76,7 @@
     },
     vol(pos) { // distance attenuation to nearest human
       let d = 1e9;
-      for (const t of game.tanks) if (t.human && t.alive) d = Math.min(d, Math.hypot(t.x - pos.x, t.z - pos.z));
+      for (const t of game.tanks) if (t.human && !t.remote && t.alive) d = Math.min(d, Math.hypot(t.x - pos.x, t.z - pos.z));
       if (d === 1e9) d = 60;
       return clamp(1 - d / 320, 0, 1) ** 1.6;
     },
@@ -120,6 +120,7 @@
   function readController(tank) {
     const c = { gearUp: false, gearDown: false, steer: 0, trav: 0, elev: 0, fire: false, lock: false, next: false, ammo: false, smoke: false, sight: false, mouse: false };
     const src = tank.input;
+    if (src && src.startsWith('net:')) return game.net && game.net.remoteCtl ? game.net.remoteCtl(src.slice(4)) : c;
     if (src === 'kb1' || src === 'kb2') {
       const m = KB[src];
       c.gearUp = pressed.has(m.up); c.gearDown = pressed.has(m.down);
@@ -129,7 +130,7 @@
       c.fire = pressed.has(m.fire); c.lock = keys.has(m.lock); c.next = pressed.has(m.next);
       c.ammo = pressed.has(m.ammo); c.smoke = pressed.has(m.smoke); c.sight = pressed.has(m.sight);
       if (src === 'kb1' && mouse.locked) {
-        c.mouse = true;
+        c.mouse = true; c.mdx = mouse.dx; c.mdy = mouse.dy;
         c.fire = c.fire || mouse.leftPressed; c.lock = c.lock || mouse.right;
         if (mouse.wheel) c.ammo = true;
       }
@@ -317,6 +318,20 @@
       if (Math.random() < 0.5) fxSmoke.emit({ x, y: y + 2, z, vx: rnd(-0.5, 0.5), vy: rnd(2, 4), vz: rnd(-0.5, 0.5), life: rnd(2, 4), s0: 2, s1: 8, c0: [0.12, 0.11, 0.1], c1: [0.35, 0.34, 0.33], a0: 0.6, a1: 0, drag: 0.4 });
     },
   };
+
+  /* ---------------- Network event capture ----------------
+   * On an online host, visual/audio one-shots are recorded and replayed
+   * on clients. FXraw is the unrecorded version for per-frame visuals. */
+  const NET_EV = [];
+  const FXraw = Object.assign({}, FX);
+  for (const k of ['explosion', 'muzzle', 'sparks', 'smokeScreen']) {
+    FX[k] = (...a) => { if (game.net && game.net.role === 'host' && game.net.started) NET_EV.push(['fx', k, a.map((v) => Math.round(v * 100) / 100)]); return FXraw[k](...a); };
+  }
+  const AudioRaw = {};
+  for (const k of ['shot', 'boom', 'ping', 'clang']) {
+    AudioRaw[k] = Audio[k].bind(Audio);
+    Audio[k] = (pos, big) => { if (game.net && game.net.role === 'host' && game.net.started) NET_EV.push(['au', k, [Math.round(pos.x), Math.round(pos.z), big ? 1 : 0]]); return AudioRaw[k](pos, big); };
+  }
 
   /* ---------------- Materials ---------------- */
   const MAT = {
@@ -509,10 +524,11 @@
   };
   window.__game = game; // debug/testing hook
 
-  function makeTanks() {
-    for (const t of game.tanks) scene.remove(t.mesh.root);
+  function makeTanks(noRemote) {
+    for (const t of game.tanks) { scene.remove(t.mesh.root); scene.remove(t.mesh.turret); }
     game.tanks = []; tankUid = 0;
-    const H = settings.humans, B = settings.bots;
+    const remote = noRemote ? [] : (game.net && game.net.role === 'host' ? game.net.players() : []);
+    const L = settings.humans, H = L + remote.length, B = settings.bots;
     const skill = { easy: 0.35, normal: 0.62, hard: 0.85, ace: 1.0 }[settings.diff] || 0.62;
     const total = H + B;
     for (let i = 0; i < total; i++) {
@@ -522,8 +538,14 @@
       else if (settings.mode === 'coop') team = human ? 0 : 1;
       else team = i % 2;
       const color = settings.mode === 'ffa' ? COLORS[i % COLORS.length] : TEAM_COLORS[team];
-      const name = human ? `P${i + 1}` : `BOT-${['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 'HOTEL'][i - H] || i}`;
-      game.tanks.push(new Tank({ name, team, color, human, input: human ? settings.inputs[i] : null, slot: human ? i : -1, skill: human ? 0 : skill * rnd(0.85, 1.1) }));
+      const rp = human && i >= L ? remote[i - L] : null;
+      const callsign = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT', 'GOLF', 'HOTEL'][i - H] || String(i);
+      const driver = human ? null : settings.botDriver === 'rl' ? 'rl' : settings.botDriver === 'mix' ? ((i - H) % 2 ? 'script' : 'rl') : 'script';
+      const useRL = driver === 'rl' && window.RLPolicy && window.RLWeights;
+      const name = rp ? rp.name : human ? `P${i + 1}` : `${useRL ? 'NN' : 'BOT'}-${callsign}`;
+      const t = new Tank({ name, team, color, human, input: rp ? 'net:' + rp.id : human ? settings.inputs[i] : null, slot: human ? i : -1, skill: human ? 0 : skill * rnd(0.85, 1.1) });
+      t.remote = !!rp; t.connId = rp ? rp.id : null; t.driver = useRL ? 'rl' : 'script';
+      game.tanks.push(t);
     }
   }
 
@@ -552,7 +574,7 @@
   }
 
   function setupViews() {
-    const humans = game.tanks.filter((t) => t.human);
+    const humans = game.net && game.net.role === 'client' ? game.tanks.filter((t) => t.id === game.net.you) : game.tanks.filter((t) => t.human && !t.remote);
     const W = window.innerWidth, Hh = window.innerHeight;
     const n = Math.max(1, humans.length);
     let rects;
@@ -646,7 +668,7 @@
       t.target = best;
     }
     t.lockLost = 0;
-    if (t.human) Audio.beep(1200);
+    if (t.human && !t.remote) Audio.beep(1200);
   }
 
   /* ================================================================ */
@@ -685,8 +707,12 @@
     if (killer && killer !== u && killer.team !== u.team) killer.stats.kills++;
     const how = info && info.how ? ` [${info.how}]` : '';
     feed(killer && killer !== u ? `${killer.name} ✖ ${u.name}${how}` : `${u.name} destroyed${how}`, '#' + new T3.Color(killer ? killer.color : 0xffffff).getHexString());
-    FX.explosion(u.x, u.y + 1.5, u.z, 1.8);
+    killVisual(u);
     Audio.boom(u, true);
+    if (u.human) message('รถถังของคุณถูกทำลาย / DESTROYED', 2.5, u);
+  }
+  function killVisual(u) {
+    FXraw.explosion(u.x, u.y + 1.5, u.z, 1.8);
     // turret pop
     const tw = new T3.Vector3(); u.mesh.turret.getWorldPosition(tw);
     u.mesh.root.remove(u.mesh.turret); scene.add(u.mesh.turret);
@@ -695,7 +721,6 @@
     const blacken = (o) => { if (o.isMesh) { o.userData.orig = o.userData.orig || o.material; o.material = MAT.wreck; } };
     u.mesh.root.traverse(blacken); u.mesh.turret.traverse(blacken);
     world.wrecks.push({ x: u.x, z: u.z, tank: u, fire: 14 });
-    if (u.human) message('รถถังของคุณถูกทำลาย / DESTROYED', 2.5, u);
   }
 
   function explode(s, x, y, z, direct) {
@@ -864,19 +889,14 @@
       }
     }
     t.x = nx; t.z = nz; t.y = heightAt(t.x, t.z);
-    // dust trail
-    if (Math.abs(t.speed) > 3 && Math.random() < 0.35 * dt * 60 * 0.4) {
-      const b = { x: t.x - f.x * 3.2, z: t.z - f.z * 3.2 };
-      FX.dust(b.x, heightAt(b.x, b.z), b.z, clamp(Math.abs(t.speed) / 12, 0.4, 1.2));
-    }
   }
 
   function aimTank(t, ctl, dt) {
     const rate = TRAVERSE * (t.turretDmg > 0 ? 0.35 : 1);
     const fine = t.sight ? 0.35 : 1;
     if (ctl.mouse) {
-      t.cmdYaw -= mouse.dx * 0.0022 * (t.sight ? 0.35 : 1);
-      t.cmdPitch = clamp(t.cmdPitch - mouse.dy * 0.0016 * (t.sight ? 0.35 : 1), PITCH_MIN, PITCH_MAX);
+      t.cmdYaw -= (ctl.mdx || 0) * 0.0022 * (t.sight ? 0.35 : 1);
+      t.cmdPitch = clamp(t.cmdPitch - (ctl.mdy || 0) * 0.0016 * (t.sight ? 0.35 : 1), PITCH_MIN, PITCH_MAX);
     }
     if (ctl.trav) t.cmdYaw = t.turYaw - ctl.trav * rate * fine * 1.2 * 0.25 - ctl.trav * rate * fine * dt;
     if (ctl.elev) t.cmdPitch = clamp(t.pitch + ctl.elev * ELEV * fine * dt + ctl.elev * 0.01, PITCH_MIN, PITCH_MAX);
@@ -965,6 +985,14 @@
     if (Math.abs(t.speed) < 1.2 && t.gear > 0) b.stuck += dt; else b.stuck = Math.max(0, b.stuck - dt);
     if (b.stuck > 1.2) { b.reverseT = 1.6; b.stuck = 0; }
     if (b.reverseT > 0) { b.reverseT -= dt; wantGear = -1; }
+    if (t.driver === 'rl' && window.RLPolicy && window.RLWeights) {
+      // neural driving policy (trained offline with Evolution Strategies, see rl/)
+      let tgo = null;
+      if (t.target) { const k = trackerOf(t, t.target); if (k) { const p = k.predict(0), v = k.vel; tgo = { x: p.x, z: p.z, vx: v.x, vz: v.z, yaw: t.target.yaw, turYaw: t.target.turYaw }; } }
+      const feat = RLPolicy.features({ x: t.x, z: t.z, yaw: t.yaw, speed: t.speed, hp: t.hp, warn: t.warn, id: t.id }, tgo, world.zone, (yaw, d) => probe(t.x, t.z, yaw, d), game.roundTime);
+      const cmd = RLPolicy.act(window.RLWeights, feat);
+      ctl.steer = cmd.steer; wantGear = cmd.gear;
+    }
     if (wantGear > t.gear) ctl.gearUp = true; else if (wantGear < t.gear) ctl.gearDown = true;
     // gunnery
     if (t.target && t.sol) {
@@ -1003,6 +1031,16 @@
     { id: 'smoke', label: 'SMOKE +2', color: 0xd7dde5 },
     { id: 'radar', label: 'RADAR UPLINK', color: 0x35d6e0 },
   ];
+  let crateUid = 0;
+  function crateMesh(type) {
+    const g = new T3.Group();
+    const box = new T3.Mesh(new T3.BoxGeometry(1.8, 1.4, 1.8), new T3.MeshLambertMaterial({ color: type.color, emissive: type.color, emissiveIntensity: 0.25 }));
+    box.castShadow = true; g.add(box);
+    const chute = new T3.Mesh(new T3.SphereGeometry(3, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), new T3.MeshLambertMaterial({ color: 0xeeeeee, side: T3.DoubleSide }));
+    chute.position.y = 6; g.add(chute);
+    scene.add(g);
+    return { g, chute };
+  }
   function spawnCrate() {
     const z = world.zone;
     for (let i = 0; i < 20; i++) {
@@ -1010,15 +1048,11 @@
       const x = z.x + Math.sin(a) * r, zz = z.z + Math.cos(a) * r;
       if (Math.abs(x) > HALF - 15 || Math.abs(zz) > HALF - 15) continue;
       if (world.obstacles.some((o) => o.alive && Math.abs(o.x - x) < o.w / 2 + 3 && Math.abs(o.z - zz) < o.d / 2 + 3)) continue;
-      const type = CRATE_TYPES[(Math.random() * CRATE_TYPES.length) | 0];
-      const g = new T3.Group();
-      const box = new T3.Mesh(new T3.BoxGeometry(1.8, 1.4, 1.8), new T3.MeshLambertMaterial({ color: type.color, emissive: type.color, emissiveIntensity: 0.25 }));
-      box.castShadow = true; g.add(box);
-      const chute = new T3.Mesh(new T3.SphereGeometry(3, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), new T3.MeshLambertMaterial({ color: 0xeeeeee, side: T3.DoubleSide }));
-      chute.position.y = 6; g.add(chute);
+      const ti = (Math.random() * CRATE_TYPES.length) | 0, type = CRATE_TYPES[ti];
+      const { g, chute } = crateMesh(type);
       const y = heightAt(x, zz) + 70;
-      g.position.set(x, y, zz); scene.add(g);
-      world.crates.push({ x, z: zz, y, type, mesh: g, chute, landed: false });
+      g.position.set(x, y, zz);
+      world.crates.push({ id: ++crateUid, ti, x, z: zz, y, type, mesh: g, chute, landed: false });
       feed(`SUPPLY DROP — ${type.label}`, '#9fe8c0');
       return;
     }
@@ -1035,7 +1069,7 @@
         if (c.type.id === 'repair') { t.hp = Math.min(MAX_HP, t.hp + 35); t.trackDmg = 0; t.turretDmg = 0; }
         if (c.type.id === 'smoke') t.smoke += 2;
         if (c.type.id === 'radar') t.radar = 15;
-        if (t.human) { message(`รับ ${c.type.label}`, 1.6, t); Audio.beep(900); }
+        if (t.human) { message(`รับ ${c.type.label}`, 1.6, t); if (!t.remote) Audio.beep(900); }
         scene.remove(c.mesh); world.crates.splice(i, 1); break;
       }
     }
@@ -1079,7 +1113,7 @@
   /* ================================================================ */
   /* Update loop                                                       */
   /* ================================================================ */
-  function updateTank(t, dt) {
+  function updateTankVisual(t, dt) {
     if (!t.alive) {
       if (t.fly) {
         const tr = t.mesh.turret;
@@ -1091,6 +1125,28 @@
       }
       return;
     }
+    const m = t.mesh;
+    m.root.position.set(t.x, t.y, t.z);
+    m.root.rotation.y = t.yaw;
+    const f = t.fwd, rx = Math.cos(t.yaw), rz = -Math.sin(t.yaw);
+    const pitchH = Math.atan2(heightAt(t.x + f.x * 3, t.z + f.z * 3) - heightAt(t.x - f.x * 3, t.z - f.z * 3), 6);
+    const rollH = Math.atan2(heightAt(t.x + rx * 1.7, t.z + rz * 1.7) - heightAt(t.x - rx * 1.7, t.z - rz * 1.7), 3.4);
+    m.hullG.rotation.x = lerp(m.hullG.rotation.x, -pitchH + t.recoil * 0.04, 0.3);
+    m.hullG.rotation.z = lerp(m.hullG.rotation.z, rollH, 0.3);
+    m.turret.rotation.y = t.turYaw - t.yaw;
+    m.barrelPivot.rotation.x = -t.pitch;
+    m.barrel.position.z = -t.recoil * 0.7;
+    if (t.hitFlash > 0) m.body.emissive && m.body.emissive.setRGB(t.hitFlash * 0.6, t.hitFlash * 0.15, 0);
+    else if (m.body.emissive) m.body.emissive.setRGB(0, 0, 0);
+    if (t.trackDmg > 0 && Math.random() < 0.3) FXraw.sparks(t.x, t.y + 0.5, t.z);
+    if (Math.abs(t.speed) > 3 && Math.random() < 0.35 * dt * 60 * 0.4) {
+      const b = { x: t.x - f.x * 3.2, z: t.z - f.z * 3.2 };
+      FXraw.dust(b.x, heightAt(b.x, b.z), b.z, clamp(Math.abs(t.speed) / 12, 0.4, 1.2));
+    }
+  }
+
+  function updateTank(t, dt) {
+    if (!t.alive) { updateTankVisual(t, dt); return; }
     const ctl = t.human ? readController(t) : botThink(t, dt);
     if (game.state === 'countdown') { ctl.fire = false; }
     t.reload = Math.max(0, t.reload - dt);
@@ -1100,7 +1156,7 @@
     t.recoil = Math.max(0, t.recoil - dt * 3); t.shake = Math.max(0, t.shake - dt * 1.6); t.hitFlash = Math.max(0, t.hitFlash - dt * 3);
     if (t.human) {
       if (ctl.sight) t.sight = !t.sight;
-      if (ctl.ammo) { t.ammo = t.ammo === 'AP' ? 'HE' : 'AP'; t.reload = Math.max(t.reload, 1.2); Audio.beep(600); }
+      if (ctl.ammo) { t.ammo = t.ammo === 'AP' ? 'HE' : 'AP'; t.reload = Math.max(t.reload, 1.2); if (!t.remote) Audio.beep(600); }
       if (ctl.next) pickTarget(t, true);
       if (ctl.lock && (!t.target || !t.target.alive) && settings.fcs !== 'off') pickTarget(t, false);
     }
@@ -1114,7 +1170,7 @@
     if (t.target) {
       const k = trackerOf(t, t.target);
       if (!t.target.alive || !k) t.target = null;
-      else if (k.coast > 4) { t.target = null; if (t.human) Audio.beep(300); }
+      else if (k.coast > 4) { t.target = null; if (t.human && !t.remote) Audio.beep(300); }
     }
     t.solTimer -= dt; t.pkTimer -= dt;
     if (t.solTimer <= 0 && (settings.fcs !== 'off' || !t.human)) { t.solTimer = 0.1; fcsSolve(t); }
@@ -1134,25 +1190,11 @@
     if (ctl.fire && game.state === 'play') fire(t);
     // own impact preview (for HUD)
     t.impTimer -= dt;
-    if (t.human && t.impTimer <= 0) {
+    if (t.human && !t.remote && t.impTimer <= 0) {
       t.impTimer = 0.08;
       t.impact = F.trajectory(t.muzzle(), t.turYaw, t.pitch, F.AMMO[t.ammo], game.wind, heightAt, t.vel, 5);
     }
-    // visuals
-    const m = t.mesh;
-    m.root.position.set(t.x, t.y, t.z);
-    m.root.rotation.y = t.yaw;
-    const f = t.fwd, rx = Math.cos(t.yaw), rz = -Math.sin(t.yaw);
-    const pitchH = Math.atan2(heightAt(t.x + f.x * 3, t.z + f.z * 3) - heightAt(t.x - f.x * 3, t.z - f.z * 3), 6);
-    const rollH = Math.atan2(heightAt(t.x + rx * 1.7, t.z + rz * 1.7) - heightAt(t.x - rx * 1.7, t.z - rz * 1.7), 3.4);
-    m.hullG.rotation.x = lerp(m.hullG.rotation.x, -pitchH + t.recoil * 0.04, 0.3);
-    m.hullG.rotation.z = lerp(m.hullG.rotation.z, rollH, 0.3);
-    m.turret.rotation.y = t.turYaw - t.yaw;
-    m.barrelPivot.rotation.x = -t.pitch;
-    m.barrel.position.z = -t.recoil * 0.7;
-    if (t.hitFlash > 0) m.body.emissive && m.body.emissive.setRGB(t.hitFlash * 0.6, t.hitFlash * 0.15, 0);
-    else if (m.body.emissive) m.body.emissive.setRGB(0, 0, 0);
-    if (t.trackDmg > 0 && Math.random() < 0.3) FX.sparks(t.x, t.y + 0.5, t.z);
+    updateTankVisual(t, dt);
   }
 
   function updateThreats() {
@@ -1217,6 +1259,7 @@
       Audio.engine.frequency.value = 34 + sp * 3.2;
       Audio.engineGain.gain.value = game.state === 'play' || game.state === 'countdown' ? (hs.length ? 0.06 + sp * 0.006 : 0) : 0;
     }
+    if (game.net && game.net.role === 'host' && game.net.started) game.net.tick(dt);
     pressed.clear(); mouse.dx = mouse.dy = 0; mouse.leftPressed = mouse.rightPressed = false; mouse.wheel = 0;
   }
 
@@ -1551,7 +1594,9 @@
     settings.diff = $('diff').value;
     settings.rounds = +$('rounds').value;
     for (let i = 0; i < 4; i++) settings.inputs[i] = $('in' + i).value;
-    if (settings.humans + settings.bots < 2) settings.bots = 2 - settings.humans;
+    settings.botDriver = $('driver').value;
+    const remote = game.net && game.net.role === 'host' ? game.net.players().length : 0;
+    if (settings.humans + remote + settings.bots < 2) settings.bots = 2 - settings.humans - remote;
   }
   function refreshMenu() {
     const h = +$('humans').value;
@@ -1567,6 +1612,7 @@
     game.round = 0;
     $('menu').classList.add('hidden'); $('end').classList.add('hidden');
     startRound();
+    if (game.net && game.net.role === 'host') { game.net.started = true; game.net.sendRoster(); }
   }
   function showMatchEnd() {
     game.state = 'matchEnd';
@@ -1576,14 +1622,18 @@
     $('endTitle').textContent = `${settings.mode === 'ffa' ? champ.name : teamName(champ.team)} ชนะการแข่งขัน!`;
     $('endTable').innerHTML = '<tr><th>รถถัง</th><th>ชนะ</th><th>Kill</th><th>ดาเมจ</th><th>ยิง</th><th>ถูกเป้า</th><th>แม่นยำ</th></tr>' +
       rows.map((u) => `<tr><td style="color:#${new T3.Color(u.color).getHexString()}">${u.name}${u.human ? ' 🎮' : ''}</td><td>${u.wins}</td><td>${u.stats.kills}</td><td>${u.stats.dmg | 0}</td><td>${u.stats.shots}</td><td>${u.stats.hits}</td><td>${u.stats.shots ? ((u.stats.hits / u.stats.shots) * 100) | 0 : 0}%</td></tr>`).join('');
+    $('again').classList.toggle('hidden', !!(game.net && game.net.role === 'client'));
     $('end').classList.remove('hidden');
   }
   function togglePause() {
-    if (game.state === 'matchEnd') return;
+    if (game.state === 'matchEnd' || (game.net && game.net.started)) return;
     game.paused = !game.paused;
     if (game.paused && document.exitPointerLock) document.exitPointerLock();
   }
-  function toMenu() {
+  function toMenu(fromNet) {
+    if (game.net && game.net.role === 'client' && !fromNet) netLeave();
+    if (game.net && game.net.role === 'host') { game.net.started = false; game.net.broadcast({ type: 'back' }); game.net.lobby(); }
+    for (const t of game.tanks) t.remote = false;
     game.paused = false; game.state = 'menu';
     $('end').classList.add('hidden'); $('menu').classList.remove('hidden');
     if (document.exitPointerLock) document.exitPointerLock();
@@ -1595,7 +1645,7 @@
   function demo() {
     const saved = { ...settings, inputs: settings.inputs.slice() };
     settings.humans = 0; settings.bots = 5; settings.mode = 'ffa'; settings.diff = 'hard';
-    makeTanks(); game.round = 0; startRound(); game.state = 'play'; game.countdown = 0;
+    makeTanks(true); game.round = 0; startRound(); game.state = 'play'; game.countdown = 0;
     Object.assign(settings, saved, { humans: saved.humans, bots: saved.bots });
     game.demo = true;
   }
@@ -1607,6 +1657,315 @@
   window.addEventListener('gamepadconnected', refreshMenu);
   window.addEventListener('gamepaddisconnected', refreshMenu);
 
+
+  /* ================================================================ */
+  /* Online multiplayer (host-authoritative)                           */
+  /*  - The host runs the whole simulation, bots included.             */
+  /*  - Clients send their controller state ~30x/s.                    */
+  /*  - The host sends a snapshot 20x/s: tanks, shells, zone, crates,  */
+  /*    buildings, feed, one-shot FX/audio events, plus each client's  */
+  /*    private FCS data for its HUD.                                  */
+  /*  - Clients interpolate and render; the world itself is rebuilt    */
+  /*    from the round seed, so terrain/buildings are identical.       */
+  /* ================================================================ */
+  const r2 = (v) => Math.round(v * 100) / 100, r3 = (v) => Math.round(v * 1000) / 1000;
+  const CTL_COUNTS = ['gu', 'gd', 'fire', 'next', 'ammo', 'smoke', 'sight'];
+  const CTL_MAP = { gu: 'gearUp', gd: 'gearDown', fire: 'fire', next: 'next', ammo: 'ammo', smoke: 'smoke', sight: 'sight' };
+  function netStatus(html) { $('netStatus').innerHTML = html; }
+  function esc(x) { return String(x).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function myName() { const v = ($('netName').value || '').trim().slice(0, 12); return v || 'Player'; }
+
+  function netHost() {
+    if (game.net) return;
+    const tr = MFTransport.pick();
+    const code = Array.from({ length: 5 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[(Math.random() * 32) | 0]).join('');
+    const net = { role: 'host', code, started: false, conns: new Map(), inputs: {}, acc: 0, hostName: myName() };
+    game.net = net;
+    net.players = () => [...net.conns.values()].filter((c) => c.ready).map((c) => ({ id: c.id, name: c.name }));
+    net.broadcast = (m) => { for (const c of net.conns.values()) if (c.ready) c.send(m); };
+    net.lobby = () => {
+      const names = [net.hostName + ' (host)'].concat(net.players().map((p) => p.name));
+      net.broadcast({ type: 'lobby', names, code });
+      $('netPlayers').textContent = `ในห้อง ${names.length} คน: ${names.join(', ')}`;
+      $('start').textContent = net.players().length ? `เริ่มสงครามออนไลน์ · ${names.length} คน` : 'เริ่มสงคราม · DEPLOY';
+    };
+    net.remoteCtl = (id) => {
+      const c = { gearUp: false, gearDown: false, steer: 0, trav: 0, elev: 0, fire: false, lock: false, next: false, ammo: false, smoke: false, sight: false, mouse: false, mdx: 0, mdy: 0 };
+      const st = net.inputs[id]; if (!st) return c;
+      for (const k of CTL_COUNTS) { c[CTL_MAP[k]] = st[k] > 0; st[k] = 0; }
+      c.steer = st.steer || 0; c.trav = st.trav || 0; c.elev = st.elev || 0; c.lock = !!st.lock; c.mouse = !!st.mouse;
+      c.mdx = st.mdx || 0; c.mdy = st.mdy || 0; st.mdx = st.mdy = 0;
+      return c;
+    };
+    net.sendRoster = () => {
+      const tanks = game.tanks.map((t) => ({ id: t.id, name: t.name, team: t.team, color: t.color, human: t.human }));
+      for (const c of net.conns.values()) {
+        if (!c.ready) continue;
+        const me = game.tanks.find((t) => t.connId === c.id);
+        c.send({ type: 'roster', you: me ? me.id : -1, tanks, set: { mode: settings.mode, rounds: settings.rounds, fcs: settings.fcs } });
+      }
+    };
+    net.tick = (dt) => {
+      net.acc += dt;
+      if (net.acc < 0.05) return;
+      net.acc = 0;
+      const base = snapshot();
+      for (const c of net.conns.values()) {
+        if (!c.ready) continue;
+        const me = game.tanks.find((t) => t.connId === c.id && t.remote);
+        base.me = privateOf(me); base.you = me ? me.id : -1;
+        c.send(base);
+      }
+      NET_EV.length = 0;
+    };
+    net.handle = tr.host(code, (conn) => {
+      net.conns.set(conn.id, conn);
+      conn.onData((m) => {
+        if (!m || typeof m !== 'object') return;
+        if (m.type === 'hello') {
+          if (net.players().length >= 7) { conn.send({ type: 'full' }); return; }
+          conn.name = String(m.name || 'Player').slice(0, 12).replace(/[<>]/g, ''); conn.ready = true;
+          net.inputs[conn.id] = { steer: 0, trav: 0, elev: 0, lock: false, mouse: false, mdx: 0, mdy: 0, gu: 0, gd: 0, fire: 0, next: 0, ammo: 0, smoke: 0, sight: 0 };
+          net.lobby();
+          if (net.started) conn.send({ type: 'busy' });
+        } else if (m.type === 'in' && m.c) {
+          const st = net.inputs[conn.id]; if (!st) return;
+          for (const k of CTL_COUNTS) st[k] += +m.c[k] || 0;
+          st.steer = clamp(+m.c.steer || 0, -1, 1); st.trav = clamp(+m.c.trav || 0, -1, 1); st.elev = clamp(+m.c.elev || 0, -1, 1);
+          st.lock = !!m.c.lock; st.mouse = !!m.c.mouse;
+          st.mdx += clamp(+m.c.mdx || 0, -2000, 2000); st.mdy += clamp(+m.c.mdy || 0, -2000, 2000);
+        }
+      });
+      conn.onClose(() => {
+        if (!net.conns.has(conn.id)) return;
+        net.conns.delete(conn.id); delete net.inputs[conn.id];
+        const t = game.tanks.find((u) => u.connId === conn.id);
+        if (t) { t.human = false; t.remote = false; t.input = null; t.connId = null; t.name += ' (AI)'; feed(`${t.name} หลุดการเชื่อมต่อ — AI ขับแทน`, '#ffd166'); }
+        net.lobby();
+      });
+    }, () => {
+      const link = location.origin + location.pathname + '?join=' + code + (location.search.includes('net=local') ? '&net=local' : '');
+      netStatus(`ห้อง <b class="code">${code}</b> พร้อมแล้ว · ส่งรหัสหรือลิงก์ให้เพื่อน<br><span class="link" id="netLink">${esc(link)}</span> <button class="mini" id="copyLink">คัดลอก</button>`);
+      $('copyLink').onclick = () => { const done = () => { $('copyLink').textContent = 'คัดลอกแล้ว'; }; try { navigator.clipboard.writeText(link).then(done, () => selectText($('netLink'))); } catch (e) { selectText($('netLink')); } };
+      net.lobby();
+    }, (err) => { if (game.net !== net) return; netLeave(); netStatus(`สร้างห้อง/การเชื่อมต่อมีปัญหา (${esc(err)}) — ตรวจอินเทอร์เน็ตแล้วลองใหม่`); });
+    netStatus('กำลังสร้างห้อง…');
+    $('hostBtn').disabled = true; $('joinBtn').disabled = true;
+  }
+  function selectText(el) { const r = document.createRange(); r.selectNodeContents(el); const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+
+  function snapshot() {
+    const z = world.zone;
+    return {
+      type: 'snap', st: game.state, cd: r2(game.countdown), rt: r2(game.roundTime), rd: game.round, seed: settings.seed, endT: r2(game.endT || 0),
+      set: { mode: settings.mode, rounds: settings.rounds, fcs: settings.fcs },
+      wind: [r2(game.wind.x), r2(game.wind.z)], zone: [r2(z.x), r2(z.z), r2(z.r)],
+      tk: game.tanks.map((t) => [t.id, r2(t.x), r2(t.z), r3(t.yaw), r2(t.speed), r3(t.turYaw), r3(t.pitch), Math.round(t.hp), t.alive ? 1 : 0, t.gear, r2(t.recoil), t.trackDmg > 0 ? 1 : 0, r2(t.hitFlash), t.wins, t.stats.kills, Math.round(t.stats.dmg), t.stats.shots, t.stats.hits, t.name]),
+      sh: game.shells.map((q) => [r2(q.x), r2(q.y), r2(q.z), r2(q.vx), r2(q.vy), r2(q.vz), q.ammo.id === 'HE' ? 1 : 0]),
+      ob: world.obstacles.map((o) => (o.alive ? Math.max(1, Math.round(o.hp)) : 0)),
+      cr: world.crates.map((c) => [c.id, c.ti, r2(c.x), r2(c.y), r2(c.z), c.landed ? 1 : 0]),
+      fd: game.feed.map((f) => [f.text, f.color, r2(f.t)]),
+      msg: game.msgT > 0 ? [game.msg, r2(game.msgT)] : null,
+      ev: NET_EV.slice(),
+    };
+  }
+  function privateOf(t) {
+    if (!t) return null;
+    const p = {
+      rl: r2(t.reload), am: t.ammo, sm: t.smoke, ra: r2(t.radar), wa: r2(t.warn), out: t.outside ? 1 : 0, al: t.autoLay ? 1 : 0,
+      td: t.turretDmg > 0 ? 1 : 0, msg: t.msgT > 0 ? [t.msg, r2(t.msgT)] : null, shk: r2(t.shake), tg: t.target ? t.target.id : -1,
+      pk: r2(t.pk), mk: t.masked ? 1 : 0, vis: {}, sol: null, trk: null,
+    };
+    if (t.sol) p.sol = { yaw: r3(t.sol.yaw), pitch: r3(t.sol.pitch), tof: r2(t.sol.tof), aim: [r2(t.sol.aim.x), r2(t.sol.aim.y), r2(t.sol.aim.z)], range: r2(t.sol.range), lead: r3(t.sol.lead), ok: t.sol.ok ? 1 : 0 };
+    for (const [id, k] of t.trackers) if (k.ready) p.vis[id] = r2(k.coast);
+    if (t.target && t.sol) {
+      const k = trackerOf(t, t.target);
+      if (k) p.trk = { sp: r2(k.speed), hd: r3(k.heading), om: r3(k.omega), mn: r2(k.manoeuvre), path: k.path(t.sol.tof * 1.25, 10).map((q) => [r2(q.x), r2(q.z)]) };
+    }
+    return p;
+  }
+
+  /* ---------------- client side ---------------- */
+  function netJoin(code) {
+    if (game.net) return;
+    code = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5);
+    if (code.length !== 5) { netStatus('ใส่รหัสห้อง 5 ตัวอักษรจากโฮสต์'); return; }
+    const tr = MFTransport.pick();
+    const net = { role: 'client', code, started: false, you: -1, acc: 0, seed: null, inp: null, shells: [], snapAt: 0, ended: false };
+    game.net = net;
+    netStatus(`กำลังเชื่อมต่อห้อง <b class="code">${code}</b>…`);
+    $('hostBtn').disabled = true; $('joinBtn').disabled = true;
+    net.handle = tr.join(code, (conn) => {
+      net.conn = conn;
+      conn.send({ type: 'hello', name: myName() });
+      netStatus(`เชื่อมต่อห้อง <b class="code">${code}</b> แล้ว · รอโฮสต์กดเริ่ม`);
+      $('start').classList.add('hidden');
+      conn.onData(onNetMsg);
+      conn.onClose(() => {
+        if (!game.net || game.net !== net) return;
+        netLeave(); toMenu(true);
+        netStatus('การเชื่อมต่อกับโฮสต์หลุด — เข้าร่วมใหม่ได้');
+      });
+    }, (err) => {
+      netLeave();
+      netStatus(err === 'peer-unavailable' ? `ไม่พบห้อง ${esc(code)} — ตรวจรหัสอีกครั้ง หรือให้โฮสต์เปิดห้องค้างไว้` : `เชื่อมต่อไม่สำเร็จ (${esc(err)})`);
+    });
+  }
+  function netLeave() {
+    const net = game.net; if (!net) return;
+    try { net.handle && net.handle.close(); } catch (e) { /* ignore */ }
+    game.net = null;
+    $('hostBtn').disabled = false; $('joinBtn').disabled = false;
+    $('start').classList.remove('hidden'); $('start').textContent = 'เริ่มสงคราม · DEPLOY';
+    $('netPlayers').textContent = '';
+  }
+
+  function onNetMsg(m) {
+    const net = game.net; if (!net || !m) return;
+    if (m.type === 'lobby') { $('netPlayers').textContent = `ในห้อง ${m.names.length} คน: ${m.names.join(', ')}`; return; }
+    if (m.type === 'full') { netLeave(); netStatus('ห้องเต็มแล้ว (8 คน)'); return; }
+    if (m.type === 'busy') { netStatus(`เชื่อมต่อห้อง <b class="code">${net.code}</b> แล้ว · โฮสต์กำลังเล่นอยู่ จะได้เข้ารอบการแข่งขันถัดไป`); return; }
+    if (m.type === 'back') { net.started = false; toMenu(true); netStatus(`อยู่ในห้อง <b class="code">${net.code}</b> · รอโฮสต์เริ่มการแข่งขันใหม่`); $('start').classList.add('hidden'); return; }
+    if (m.type === 'roster') {
+      for (const t of game.tanks) { scene.remove(t.mesh.root); scene.remove(t.mesh.turret); }
+      game.tanks = [];
+      for (const r of m.tanks) {
+        const t = new Tank({ name: r.name, team: r.team, color: r.color, human: r.human, input: r.id === m.you ? settings.inputs[0] : null, slot: -1 });
+        t.id = r.id; t.remote = r.id !== m.you;
+        t.spawn(0, 0, 0);
+        game.tanks.push(t);
+      }
+      Object.assign(settings, m.set);
+      net.you = m.you; net.seed = null; net.started = true; net.ended = false;
+      game.demo = false; game.paused = false; game.round = 0;
+      $('menu').classList.add('hidden'); $('end').classList.add('hidden');
+      Audio.init(); if (Audio.ctx && Audio.ctx.state === 'suspended') Audio.ctx.resume();
+      return;
+    }
+    if (m.type === 'snap' && net.started) applySnap(m);
+  }
+
+  const shellPool = [];
+  function applySnap(m) {
+    const net = game.net;
+    const byId = new Map(game.tanks.map((t) => [t.id, t]));
+    if (m.seed !== net.seed || m.rd !== game.round) {
+      net.seed = m.seed; game.round = m.rd; settings.seed = m.seed;
+      buildWorld(m.seed);
+      for (const row of m.tk) { const t = byId.get(row[0]); if (t) { t.spawn(row[1], row[2], row[3]); t.net = null; } }
+      setupViews();
+    }
+    Object.assign(settings, m.set);
+    game.countdown = m.cd; game.roundTime = m.rt; game.endT = m.endT;
+    game.wind = { x: m.wind[0], z: m.wind[1] };
+    const z = world.zone; z.x = m.zone[0]; z.z = m.zone[1]; z.r = m.zone[2];
+    for (const row of m.tk) {
+      const t = byId.get(row[0]); if (!t) continue;
+      t.net = { x: row[1], z: row[2], yaw: row[3], turYaw: row[5], pitch: row[6] };
+      t.speed = row[4]; t.hp = row[7]; t.gear = row[9]; t.recoil = Math.max(t.recoil, row[10]); t.trackDmg = row[11] ? 1 : 0; t.hitFlash = Math.max(t.hitFlash, row[12]);
+      t.wins = row[13]; t.stats.kills = row[14]; t.stats.dmg = row[15]; t.stats.shots = row[16]; t.stats.hits = row[17]; t.name = row[18];
+      if (t.alive && !row[8]) { t.x = row[1]; t.z = row[2]; t.y = heightAt(t.x, t.z); t.turYaw = row[5]; t.alive = false; t.hp = 0; killVisual(t); }
+    }
+    net.shells = m.sh; net.snapAt = performance.now();
+    m.ob.forEach((hp, i) => { const o = world.obstacles[i]; if (!o) return; if (hp === 0 && o.alive) damageBuilding(o, 1e6); else if (o.alive && hp < o.hp - 5) { o.hp = hp; o.mat.color.multiplyScalar(0.94); } });
+    const seen = new Set();
+    for (const [id, ti, x, y, zz, landed] of m.cr) {
+      seen.add(id);
+      let c = world.crates.find((q) => q.id === id);
+      if (!c) { const mm = crateMesh(CRATE_TYPES[ti]); c = { id, ti, type: CRATE_TYPES[ti], mesh: mm.g, chute: mm.chute, landed: false }; world.crates.push(c); }
+      c.x = x; c.y = y; c.z = zz;
+      if (landed && !c.landed) { c.landed = true; c.mesh.remove(c.chute); }
+      c.mesh.position.set(x, y, zz);
+    }
+    for (let i = world.crates.length - 1; i >= 0; i--) if (!seen.has(world.crates[i].id)) { scene.remove(world.crates[i].mesh); world.crates.splice(i, 1); }
+    game.feed = m.fd.map(([text, color, t]) => ({ text, color, t }));
+    if (m.msg) { game.msg = m.msg[0]; game.msgT = m.msg[1]; } else game.msgT = 0;
+    for (const e of m.ev) {
+      if (e[0] === 'fx' && FXraw[e[1]]) FXraw[e[1]](...e[2]);
+      else if (e[0] === 'au' && AudioRaw[e[1]]) AudioRaw[e[1]]({ x: e[2][0], z: e[2][1] }, !!e[2][2]);
+    }
+    const me = byId.get(net.you), p = m.me;
+    if (me && p) {
+      me.reload = p.rl; me.ammo = p.am; me.smoke = p.sm; me.radar = p.ra; me.warn = p.wa; me.outside = !!p.out; me.autoLay = !!p.al;
+      me.turretDmg = p.td; me.shake = Math.max(me.shake, p.shk); me.pk = p.pk; me.masked = !!p.mk;
+      if (p.msg) { me.msg = p.msg[0]; me.msgT = p.msg[1]; }
+      me.target = p.tg >= 0 ? byId.get(p.tg) || null : null;
+      me.sol = p.sol ? { yaw: p.sol.yaw, pitch: p.sol.pitch, tof: p.sol.tof, aim: { x: p.sol.aim[0], y: p.sol.aim[1], z: p.sol.aim[2] }, range: p.sol.range, lead: p.sol.lead, ok: !!p.sol.ok } : null;
+      me.trackers.clear();
+      for (const id in p.vis) {
+        const k = { ready: true, seen: true, coast: p.vis[id], speed: 0, heading: 0, omega: 0, manoeuvre: 1, pathPts: [] };
+        if (p.trk && +id === p.tg) { k.speed = p.trk.sp; k.heading = p.trk.hd; k.omega = p.trk.om; k.manoeuvre = p.trk.mn; k.pathPts = p.trk.path.map(([x, zq]) => ({ x, z: zq })); }
+        k.path = () => k.pathPts;
+        me.trackers.set(+id, k);
+      }
+    }
+    game.state = m.st;
+    if (m.st === 'matchEnd' && !net.ended) { net.ended = true; showMatchEnd(); }
+    if (m.st !== 'matchEnd') net.ended = false;
+  }
+
+  function clientStep(dt) {
+    const net = game.net;
+    game.time += dt;
+    const me = game.tanks.find((t) => t.id === net.you);
+    // controller -> host
+    if (me) {
+      me.input = settings.inputs[0];
+      const c = readController(me);
+      const a = net.inp || (net.inp = { gu: 0, gd: 0, fire: 0, next: 0, ammo: 0, smoke: 0, sight: 0, mdx: 0, mdy: 0 });
+      for (const k of CTL_COUNTS) a[k] += c[CTL_MAP[k]] ? 1 : 0;
+      a.steer = c.steer; a.trav = c.trav; a.elev = c.elev; a.lock = c.lock; a.mouse = c.mouse;
+      a.mdx += c.mdx || 0; a.mdy += c.mdy || 0;
+      if (c.sight) me.sight = !me.sight;
+      net.acc += dt;
+      if (net.acc >= 1 / 30 && net.conn) { net.acc = 0; net.conn.send({ type: 'in', c: a }); net.inp = null; }
+    }
+    // interpolate tanks
+    const k = 1 - Math.exp(-dt * 14);
+    for (const t of game.tanks) {
+      if (t.net && t.alive) {
+        t.x = lerp(t.x, t.net.x, k); t.z = lerp(t.z, t.net.z, k); t.y = heightAt(t.x, t.z);
+        t.yaw += angDiff(t.net.yaw, t.yaw) * k; t.turYaw += angDiff(t.net.turYaw, t.turYaw) * k; t.pitch = lerp(t.pitch, t.net.pitch, k);
+      }
+      t.recoil = Math.max(0, t.recoil - dt * 3); t.hitFlash = Math.max(0, t.hitFlash - dt * 3); t.shake = Math.max(0, t.shake - dt * 1.6);
+      t.msgT = Math.max(0, (t.msgT || 0) - dt);
+      updateTankVisual(t, dt);
+    }
+    if (me && me.alive) {
+      me.impTimer = (me.impTimer || 0) - dt;
+      if (me.impTimer <= 0) { me.impTimer = 0.08; me.impact = F.trajectory(me.muzzle(), me.turYaw, me.pitch, F.AMMO[me.ammo], game.wind, heightAt, me.vel, 5); }
+    }
+    // shells: extrapolate from last snapshot
+    const age = (performance.now() - net.snapAt) / 1000;
+    const sh = net.shells || [];
+    for (let i = 0; i < Math.max(sh.length, shellPool.length); i++) {
+      if (i >= sh.length) { shellPool[i].visible = false; continue; }
+      if (!shellPool[i]) { shellPool[i] = new T3.Mesh(shellGeo, new T3.MeshBasicMaterial({ color: 0xffe08a })); scene.add(shellPool[i]); }
+      const q = sh[i], mesh = shellPool[i];
+      const x = q[0] + q[3] * age, y = q[1] + q[4] * age - 4.9 * age * age, zz = q[2] + q[5] * age;
+      mesh.visible = true; mesh.material.color.setHex(q[6] ? F.AMMO.HE.color : F.AMMO.AP.color);
+      mesh.position.set(x, y, zz); mesh.lookAt(x + q[3], y + q[4], zz + q[5]);
+      FXraw.trail(x, y, zz, q[6] ? [1, 0.55, 0.25] : [1, 0.9, 0.6]);
+    }
+    const zn = world.zone; zn.mesh.scale.set(zn.r, 1, zn.r); zn.mesh.position.set(zn.x, 10, zn.z);
+    for (const w of world.wrecks) { if (w.fire > 0) { w.fire -= dt; if (Math.random() < 0.6) FXraw.fire(w.x, heightAt(w.x, w.z) + 1.5, w.z); } }
+    for (const c of world.crates) c.mesh.rotation.y += dt * 0.6;
+    fxAdd.update(dt); fxSmoke.update(dt);
+    for (const f of game.feed) f.t -= dt;
+    game.msgT -= dt;
+    if (Audio.ctx && me) { Audio.engine.frequency.value = 34 + Math.abs(me.speed) * 3.2; Audio.engineGain.gain.value = me.alive && (game.state === 'play' || game.state === 'countdown') ? 0.06 + Math.abs(me.speed) * 0.006 : 0; }
+    pressed.clear(); mouse.dx = mouse.dy = 0; mouse.leftPressed = mouse.rightPressed = false; mouse.wheel = 0;
+  }
+
+  $('hostBtn').addEventListener('click', netHost);
+  $('joinBtn').addEventListener('click', () => netJoin($('joinCode').value));
+  (function autoJoin() {
+    const q = new URLSearchParams(location.search);
+    const code = q.get('join');
+    if (code) { $('joinCode').value = code.toUpperCase().slice(0, 5); netStatus('ใส่ชื่อของคุณแล้วกด “เข้าร่วม”'); }
+    if ((!MFTransport.PeerTransport.available() || window.self !== window.top) && !q.get('net')) $('onlineNote').textContent = 'โหมดออนไลน์ต้องเปิดจาก GitHub Pages (หน้านี้บล็อกการเชื่อมต่อ peer-to-peer)';
+  })();
+
   /* ================================================================ */
   /* Main loop                                                         */
   /* ================================================================ */
@@ -1616,7 +1975,7 @@
     if (!game.paused) {
       if (game.demo && game.state === 'roundEnd') game.endT = Math.min(game.endT, 3);
       if (game.demo && game.state === 'matchEnd') demo();
-      step(dt);
+      if (game.net && game.net.role === 'client' && game.net.started) clientStep(dt); else step(dt);
       if (game.demo) { for (const t of game.tanks) t.wins = 0; }
     }
     render(dt);
@@ -1628,5 +1987,5 @@
   requestAnimationFrame(frame);
 
   // expose for automated tests
-  window.__MF = { settings, startMatch, game, heightAt, step };
+  window.__MF = { settings, startMatch, game, heightAt, step, netHost, netJoin };
 })();
