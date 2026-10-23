@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Momentum Front</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Momentum Front — เกมรถถัง 3D หลายผู้เล่น รถถังห้ามหยุด พร้อมระบบ AI ควบคุมการยิง (Kalman + ballistic solver)">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans+Thai:wght@400;600;700&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Layout: full-bleed WebGL battlefield; a periscope-style briefing panel floats over the live demo. */
+:root {
+  --ink: #0b0f0c;        /* night field */
+  --panel: rgba(12, 18, 14, 0.86);
+  --line: #2c3a2f;
+  --fg: #e6ece4;
+  --muted: #93a596;
+  --optic: #a8f0b8;      /* gunsight phosphor */
+  --amber: #ffc861;      /* tracer / call-to-action */
+  --danger: #ff6a55;
+  --f-display: "Chakra Petch", "IBM Plex Sans Thai", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans Thai", "Sarabun", system-ui, sans-serif;
+  --f-data: "IBM Plex Mono", ui-monospace, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { margin: 0; background: var(--ink); color: var(--fg); font-family: var(--f-body); overflow: hidden; }
+#gl { position: fixed; inset: 0; display: block; z-index: 0; }
+#hud { position: fixed; inset: 0; pointer-events: none; z-index: 1; }
+.hidden { display: none !important; }
+
+.overlay {
+  position: fixed; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+  padding-block: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-bottom, 0px));
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  background: radial-gradient(ellipse at center, rgba(11,15,12,0.25), rgba(11,15,12,0.78) 75%);
+  overflow-y: auto;
+}
+.brief {
+  width: min(980px, 100%); max-height: 100%; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+  backdrop-filter: blur(6px);
+  display: grid; grid-template-columns: 1.05fr 1fr; gap: 0;
+}
+.brief > section { padding: 26px 28px; min-width: 0; }
+.brief > section + section { border-left: 1px solid var(--line); }
+.eyebrow { font-family: var(--f-data); font-size: 11px; letter-spacing: 0.18em; color: var(--optic); text-transform: uppercase; }
+h1 { font-family: var(--f-display); font-weight: 700; font-size: clamp(34px, 5vw, 54px); line-height: 0.95; margin: 10px 0 6px; letter-spacing: 0.01em; text-wrap: balance; }
+h1 span { color: var(--amber); }
+.tag { font-family: var(--f-display); font-size: 17px; color: var(--muted); margin: 0 0 18px; }
+.rules { list-style: none; padding: 0; margin: 0 0 20px; display: grid; gap: 9px; font-size: 14px; line-height: 1.5; color: #cdd8cc; }
+.rules li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; }
+.rules b { font-family: var(--f-data); font-weight: 500; font-size: 11px; color: var(--amber); letter-spacing: 0.08em; padding-top: 3px; }
+.form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.form label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); font-family: var(--f-display); letter-spacing: 0.04em; }
+select { background: #101811; color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: 8px 9px; font: 600 14px var(--f-body); }
+select:focus-visible, button:focus-visible { outline: 2px solid var(--optic); outline-offset: 2px; }
+.slots { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.pad { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+.go {
+  grid-column: 1 / -1; margin-top: 6px; padding: 14px; border: 0; border-radius: 3px; cursor: pointer;
+  background: var(--amber); color: #1a1206; font: 700 18px var(--f-display); letter-spacing: 0.08em;
+}
+.go:hover { filter: brightness(1.08); }
+.keys { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.keys th { text-align: left; font-family: var(--f-display); color: var(--muted); font-weight: 600; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+.keys td { padding: 5px 6px; border-bottom: 1px solid rgba(44,58,47,0.5); vertical-align: top; }
+.keys td:not(:first-child) { font-family: var(--f-data); font-size: 11.5px; color: var(--optic); }
+.tbl { overflow-x: auto; }
+.note { font-size: 12px; color: var(--muted); line-height: 1.55; margin-top: 14px; }
+.note a { color: var(--optic); }
+#end .brief { grid-template-columns: 1fr; }
+#endTable { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 14px 0 20px; }
+#endTable th, #endTable td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+#endTable th:first-child, #endTable td:first-child { text-align: left; }
+#endTable th { font-family: var(--f-display); color: var(--muted); font-weight: 600; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+.row .go { flex: 1; min-width: 160px; }
+.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+@media (max-width: 760px) {
+  .brief { grid-template-columns: 1fr; }
+  .brief > section + section { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<canvas id="hud"></canvas>
+
+<div id="menu" class="overlay">
+  <div class="brief">
+    <section>
+      <div class="eyebrow">Briefing · ภารกิจ</div>
+      <h1>MOMENTUM<br><span>FRONT</span></h1>
+      <p class="tag">แนวหน้าไม่หยุดนิ่ง — สงครามรถถังที่ห้ามจอด</p>
+      <ul class="rules">
+        <li><b>MOVE</b><span>รถถังเคลื่อนที่ตลอดเวลา เกียร์ต่ำสุดยังวิ่ง 24 km/h — เปลี่ยนเกียร์เพื่อหลบ ไม่มีเบรก</span></li>
+        <li><b>FCS-AI</b><span>คอมพิวเตอร์ควบคุมการยิงใช้ Kalman filter วิเคราะห์ความเร็ว ทิศ อัตราเลี้ยวของเป้า แล้วคำนวณมุมยิง lead และ % โอกาสถูก</span></li>
+        <li><b>BALLISTIC</b><span>กระสุนมีแรงโน้มถ่วง แรงต้านอากาศ และลม · เกราะหน้า 120mm ข้าง 70 หลัง 40 · ยิงเฉียงเกิน 70° กระสุนแฉลบ</span></li>
+        <li><b>BARRAGE</b><span>ปืนใหญ่ถล่มนอกวงแดงที่หดเล็กลงเรื่อยๆ · กล่องเสบียงร่มชูชีพ: ซ่อม / ควัน / เรดาร์</span></li>
+        <li><b>JINK</b><span>ยิ่งคุณหักเลี้ยวและเปลี่ยนความเร็ว AI ของศัตรูยิ่งคาดเดายาก — ดูค่า Pk ตกลงได้จริง</span></li>
+      </ul>
+      <div class="form">
+        <label for="humans">ผู้เล่น (จอแยก)
+          <select id="humans"><option value="0">0 (ดูบอทสู้กัน)</option><option value="1" selected>1 คน</option><option value="2">2 คน</option><option value="3">3 คน</option><option value="4">4 คน</option></select></label>
+        <label for="bots">บอท AI
+          <select id="bots"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option></select></label>
+        <label for="mode">โหมด
+          <select id="mode"><option value="ffa">Free-for-all</option><option value="teams">2 ทีม (สลับ)</option><option value="coop">Co-op ผู้เล่น vs บอท</option></select></label>
+        <label for="fcs">ระบบช่วยยิง FCS
+          <select id="fcs"><option value="auto">Auto-lay (AI เล็งให้)</option><option value="advisor">Advisor (แสดงค่า)</option><option value="off">ปิด (เล็งเองล้วน)</option></select></label>
+        <label for="diff">ความเก่งบอท
+          <select id="diff"><option value="easy">Recruit</option><option value="normal" selected>Veteran</option><option value="hard">Elite</option><option value="ace">Ace</option></select></label>
+        <label for="rounds">ชนะกี่รอบ
+          <select id="rounds"><option value="1">1</option><option value="3" selected>3</option><option value="5">5</option></select></label>
+        <div class="slots">
+          <label id="slot0" for="in0">P1 ควบคุมด้วย<select id="in0"><option value="kb1">คีย์บอร์ด A + เมาส์</option><option value="kb2">คีย์บอร์ด B</option><option value="gp0">จอย 1</option><option value="gp1">จอย 2</option><option value="gp2">จอย 3</option><option value="gp3">จอย 4</option></select></label>
+          <label id="slot1" for="in1">P2 ควบคุมด้วย<select id="in1"><option value="kb1">คีย์บอร์ด A + เมาส์</option><option value="kb2" selected>คีย์บอร์ด B</option><option value="gp0">จอย 1</option><option value="gp1">จอย 2</option><option value="gp2">จอย 3</option><option value="gp3">จอย 4</option></select></label>
+          <label id="slot2" for="in2">P3 ควบคุมด้วย<select id="in2"><option value="gp0" selected>จอย 1</option><option value="gp1">จอย 2</option><option value="gp2">จอย 3</option><option value="gp3">จอย 4</option><option value="kb1">คีย์บอร์ด A</option><option value="kb2">คีย์บอร์ด B</option></select></label>
+          <label id="slot3" for="in3">P4 ควบคุมด้วย<select id="in3"><option value="gp0">จอย 1</option><option value="gp1" selected>จอย 2</option><option value="gp2">จอย 3</option><option value="gp3">จอย 4</option><option value="kb1">คีย์บอร์ด A</option><option value="kb2">คีย์บอร์ด B</option></select></label>
+        </div>
+        <div class="pad" id="padinfo"></div>
+        <button class="go" id="start">เริ่มสงคราม · DEPLOY</button>
+      </div>
+    </section>
+    <section>
+      <div class="eyebrow">Controls · การควบคุม</div>
+      <div class="tbl">
+      <table class="keys">
+        <tr><th>คำสั่ง</th><th>คีย์บอร์ด A</th><th>คีย์บอร์ด B</th><th>จอย</th></tr>
+        <tr><td>เกียร์ขึ้น / ลง</td><td>W / S</td><td>I / K</td><td>L-stick ↕</td></tr>
+        <tr><td>เลี้ยวตัวรถ</td><td>A / D</td><td>J / L</td><td>L-stick ↔</td></tr>
+        <tr><td>หมุนป้อมปืน</td><td>Q / E · เมาส์</td><td>U / O</td><td>R-stick ↔</td></tr>
+        <tr><td>ยก / กดปืน</td><td>R / F · เมาส์</td><td>Y / H</td><td>R-stick ↕</td></tr>
+        <tr><td>ยิง</td><td>Space · คลิกซ้าย</td><td>Enter</td><td>RT / A</td></tr>
+        <tr><td>FCS ล็อก (กดค้าง)</td><td>L-Shift · คลิกขวา</td><td>R-Shift</td><td>LT</td></tr>
+        <tr><td>สลับเป้า</td><td>C</td><td>P</td><td>RB</td></tr>
+        <tr><td>สลับกระสุน AP/HE</td><td>X · ล้อเมาส์</td><td>.</td><td>X</td></tr>
+        <tr><td>ม่านควัน</td><td>V</td><td>/</td><td>B</td></tr>
+        <tr><td>กล้องเล็ง (ซูม)</td><td>Z</td><td>;</td><td>Y</td></tr>
+        <tr><td>หยุดชั่วคราว</td><td>Esc</td><td>Esc</td><td>—</td></tr>
+      </table>
+      </div>
+      <p class="note">คลิกที่จอเกมเพื่อให้ P1 ใช้เมาส์เล็ง · 3–4 คนเล่นด้วยจอย (Xbox / PlayStation) ต่อพร้อมกันได้ · <b>AP</b> เร็ว วิถีราบ เจาะเกราะ · <b>HE</b> ช้ากว่า โค้งมากกว่า ระเบิดวงกว้าง ทำลายสายพาน<br>
+      วิถีกระสุนสีขาว = จุดตกของปืนตอนนี้ · รูปเพชร LEAD = จุดที่ AI คำนวณว่าต้องยิง · จุดเหลือง = เส้นทางที่ AI ทำนายว่าเป้าจะวิ่ง</p>
+      <p class="note">สร้างโดย นริสันต์ นาคะเกศ · แรงบันดาลใจจาก Unity Tanks! tutorial — เขียนใหม่ทั้งหมด ไม่ได้ใช้โค้ดหรือโมเดลต้นฉบับ</p>
+    </section>
+  </div>
+</div>
+
+<div id="end" class="overlay hidden">
+  <div class="brief">
+    <section>
+      <div class="eyebrow">After-action report · สรุปผลการรบ</div>
+      <h1 id="endTitle" style="font-size:clamp(28px,4vw,42px)">—</h1>
+      <div class="tbl"><table id="endTable"></table></div>
+      <div class="row">
+        <button class="go" id="again">เล่นอีกครั้ง</button>
+        <button class="go ghost" id="menuBtn">กลับเมนู</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="js/fcs.js"></script>
+<script src="js/game.js"></script>
+</body>
+</html>
